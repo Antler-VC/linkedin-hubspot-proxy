@@ -19,6 +19,22 @@ async function getPortalId() {
   return cachedPortalId;
 }
 
+// Cache location_choice value→label map
+let cachedLocationLabels = null;
+async function getLocationLabels() {
+  if (cachedLocationLabels) return cachedLocationLabels;
+  try {
+    const prop = await hsFetch("/crm/v3/properties/deals/location_choice");
+    cachedLocationLabels = {};
+    for (const opt of prop.options || []) {
+      cachedLocationLabels[opt.value] = opt.label;
+    }
+  } catch {
+    cachedLocationLabels = {};
+  }
+  return cachedLocationLabels;
+}
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -145,12 +161,16 @@ export default async function handler(req) {
           }),
         });
 
-        dealLocations = (dealsData.results || [])
+        const rawLocations = (dealsData.results || [])
           .map((d) => d.properties.location_choice)
           .filter(Boolean);
 
         // Deduplicate
-        dealLocations = [...new Set(dealLocations)];
+        const uniqueLocations = [...new Set(rawLocations)];
+
+        // Resolve internal values to human labels
+        const labels = await getLocationLabels();
+        dealLocations = uniqueLocations.map((v) => labels[v] || v);
       }
     } catch {
       // Non-fatal: return contact without deals
