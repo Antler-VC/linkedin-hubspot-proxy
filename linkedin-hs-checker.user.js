@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinkedIn HubSpot Checker
 // @namespace    https://github.com/gentian
-// @version      2.0.2
+// @version      2.0.3
 // @description  Check if LinkedIn profiles exist in HubSpot CRM
 // @match        *://*.linkedin.com/in/*
 // @match        *://*.linkedin.com/pub/*
@@ -48,6 +48,40 @@
 
   function cacheSet(slug, data) {
     cache.set(slug, { data, ts: Date.now() });
+  }
+
+  // ── Rate Limiter ──────────────────────────────────────────────────
+  const MAX_CONCURRENT = 3;
+  let activeRequests = 0;
+  const requestQueue = [];
+
+  function enqueueRequest(fn) {
+    return new Promise((resolve, reject) => {
+      requestQueue.push({ fn, resolve, reject });
+      processQueue();
+    });
+  }
+
+  function processQueue() {
+    while (activeRequests < MAX_CONCURRENT && requestQueue.length > 0) {
+      const { fn, resolve, reject } = requestQueue.shift();
+      activeRequests++;
+      fn()
+        .then(resolve)
+        .catch(reject)
+        .finally(() => {
+          activeRequests--;
+          processQueue();
+        });
+    }
+  }
+
+  function debounce(fn, ms) {
+    let timer;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), ms);
+    };
   }
 
   // ── URL Parser ──────────────────────────────────────────────────────
@@ -267,7 +301,7 @@
       const slug = extractSlug(link.href);
       if (!slug) return;
 
-      lookupSlug(slug)
+      enqueueRequest(() => lookupSlug(slug))
         .then((data) => {
           if (!data.found) return;
 
@@ -325,12 +359,14 @@
     }
   }
 
+  const debouncedSearchProcess = debounce(processSearchResults, 500);
+
   const observer = new MutationObserver(() => {
     onNavigate();
 
-    // Also reprocess search results on DOM changes (pagination/scroll)
+    // Reprocess search results on DOM changes (pagination/scroll), debounced
     if (window.location.href.includes("/search/results/people")) {
-      processSearchResults();
+      debouncedSearchProcess();
     }
   });
 
