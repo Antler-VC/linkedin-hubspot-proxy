@@ -29,18 +29,22 @@ function checkRateLimit(map, key) {
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
+// Fixed 128-iteration loop regardless of input length — prevents timing attacks
+// on both password content and password length
+const MAX_PWD_LEN = 128;
+
 function timingSafeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  let mismatch = a.length !== b.length ? 1 : 0;
+  for (let i = 0; i < MAX_PWD_LEN; i++) {
+    const ac = i < a.length ? a.charCodeAt(i) : 0xff;
+    const bc = i < b.length ? b.charCodeAt(i) : 0x00;
+    mismatch |= ac ^ bc;
   }
   return mismatch === 0;
 }
 
-// Dummy used when email not found — ensures timing-safe compare always runs
-// preventing email enumeration via response time differences
-const DUMMY_PASSWORD = "antler-dummy-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// Dummy used when email not found — ensures compare always runs regardless
+const DUMMY_PASSWORD = "antler-dummy-xxxxxxxxxxxx"; // same length as generated passwords (24 chars)
 
 function authenticate(email, password) {
   if (!email || !password) return false;
