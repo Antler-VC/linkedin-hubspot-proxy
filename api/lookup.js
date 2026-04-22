@@ -3,7 +3,22 @@ export const config = { runtime: "edge" };
 const HUBSPOT_PAT = process.env.HUBSPOT_PAT;
 const PROXY_SECRET = process.env.PROXY_SECRET;
 
-// Constant-time string comparison to prevent timing attacks
+// ── Rate limiting ────────────────────────────────────────────────────────────
+// In-memory per-IP sliding window. Resets across edge instance restarts.
+const RATE_LIMIT = 60;
+const RATE_WINDOW_MS = 60_000;
+const rateLimitMap = new Map();
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const window = (rateLimitMap.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (window.length >= RATE_LIMIT) return false;
+  window.push(now);
+  rateLimitMap.set(ip, window);
+  return true;
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
 function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
   let mismatch = 0;
@@ -13,26 +28,30 @@ function timingSafeEqual(a, b) {
   return mismatch === 0;
 }
 
-// Derive region from PAT prefix (pat-eu1-xxx → app-eu1, pat-na1-xxx → app)
+// ── Region ───────────────────────────────────────────────────────────────────
 function getRegion() {
   const m = HUBSPOT_PAT.match(/^pat-(\w+)-/);
   if (m && m[1] !== "na1") return `app-${m[1]}`;
   return "app";
 }
 
-// Cache portal ID after first fetch
+// ── Cache: portal ID ─────────────────────────────────────────────────────────
+// patKey guards against stale data if HUBSPOT_PAT changes without a redeploy
 let cachedPortalId = null;
+let cachedPortalIdKey = null;
 async function getPortalId() {
-  if (cachedPortalId) return cachedPortalId;
+  if (cachedPortalId && cachedPortalIdKey === HUBSPOT_PAT) return cachedPortalId;
   const data = await hsFetch("/account-info/v3/details");
   cachedPortalId = data.portalId;
+  cachedPortalIdKey = HUBSPOT_PAT;
   return cachedPortalId;
 }
 
-// Cache location_choice value→label map
+// ── Cache: location labels ───────────────────────────────────────────────────
 let cachedLocationLabels = null;
+let cachedLocationLabelsKey = null;
 async function getLocationLabels() {
-  if (cachedLocationLabels) return cachedLocationLabels;
+  if (cachedLocationLabels && cachedLocationLabelsKey === HUBSPOT_PAT) return cachedLocationLabels;
   try {
     const prop = await hsFetch("/crm/v3/properties/deals/location_choice");
     cachedLocationLabels = {};
@@ -42,9 +61,11 @@ async function getLocationLabels() {
   } catch {
     cachedLocationLabels = {};
   }
+  cachedLocationLabelsKey = HUBSPOT_PAT;
   return cachedLocationLabels;
 }
 
+// ── CORS ─────────────────────────────────────────────────────────────────────
 function getCorsHeaders(req) {
   const origin = req?.headers?.get("origin") || "";
   const allowed = origin.endsWith(".linkedin.com") ? origin : "https://www.linkedin.com";
@@ -62,6 +83,18 @@ function json(data, status = 200, req = null) {
   });
 }
 
+// ── Audit log ────────────────────────────────────────────────────────────────
+function audit(ip, slug, result, startMs) {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    ip,
+    slug,
+    result,
+    ms: Date.now() - startMs,
+  }));
+}
+
+// ── LinkedIn slug normalization ───────────────────────────────────────────────
 function normalizeSlug(url) {
   try {
     if (!url.startsWith("http")) url = "https://" + url;
@@ -79,6 +112,7 @@ function normalizeSlug(url) {
   }
 }
 
+// ── HubSpot API ───────────────────────────────────────────────────────────────
 async function hsFetch(path, options = {}) {
   const res = await fetch(`https://api.hubapi.com${path}`, {
     ...options,
@@ -95,6 +129,7 @@ async function hsFetch(path, options = {}) {
   return res.json();
 }
 
+// ── Handler ───────────────────────────────────────────────────────────────────
 export default async function handler(req) {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: getCorsHeaders(req) });
@@ -104,8 +139,17 @@ export default async function handler(req) {
     return json({ error: "POST only" }, 405, req);
   }
 
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() || "unknown";
+  const startMs = Date.now();
+
+  if (!checkRateLimit(ip)) {
+    audit(ip, null, "rate_limited", startMs);
+    return json({ error: "Too many requests" }, 429, req);
+  }
+
   const secret = req.headers.get("x-proxy-secret");
   if (!secret || !timingSafeEqual(secret, PROXY_SECRET)) {
+    audit(ip, null, "unauthorized", startMs);
     return json({ error: "Unauthorized" }, 401, req);
   }
 
@@ -122,7 +166,6 @@ export default async function handler(req) {
   }
 
   try {
-    // 1. Search for contact by linkedin_profile
     const searchData = await hsFetch("/crm/v3/objects/contacts/search", {
       method: "POST",
       body: JSON.stringify({
@@ -142,7 +185,6 @@ export default async function handler(req) {
       }),
     });
 
-    // Verify slug match
     const contact = (searchData.results || []).find((c) => {
       const stored = c.properties.linkedin_profile || "";
       const storedSlug = normalizeSlug(stored);
@@ -150,6 +192,7 @@ export default async function handler(req) {
     });
 
     if (!contact) {
+      audit(ip, slug, "not_found", startMs);
       return json({ found: false }, 200, req);
     }
 
@@ -157,7 +200,6 @@ export default async function handler(req) {
     const portalId = await getPortalId();
     const hubspotUrl = `https://${getRegion()}.hubspot.com/contacts/${portalId}/record/0-1/${contactId}`;
 
-    // 2. Get associated deals
     let dealLocations = [];
     try {
       const assocData = await hsFetch(
@@ -166,7 +208,6 @@ export default async function handler(req) {
       const dealIds = (assocData.results || []).map((r) => r.toObjectId);
 
       if (dealIds.length > 0) {
-        // 3. Batch read deal properties
         const dealsData = await hsFetch("/crm/v3/objects/deals/batch/read", {
           method: "POST",
           body: JSON.stringify({
@@ -179,10 +220,7 @@ export default async function handler(req) {
           .map((d) => d.properties.location_choice)
           .filter(Boolean);
 
-        // Deduplicate
         const uniqueLocations = [...new Set(rawLocations)];
-
-        // Resolve internal values to human labels
         const labels = await getLocationLabels();
         dealLocations = uniqueLocations.map((v) => labels[v] || v);
       }
@@ -190,9 +228,11 @@ export default async function handler(req) {
       // Non-fatal: return contact without deals
     }
 
+    audit(ip, slug, "found", startMs);
     return json({ found: true, hubspotUrl, contactId, dealLocations }, 200, req);
   } catch (err) {
     console.error("Lookup error:", err.message);
+    audit(ip, slug, "error", startMs);
     return json({ error: "Lookup failed" }, 502, req);
   }
 }
