@@ -2,6 +2,7 @@ export const config = { runtime: "edge" };
 
 const HUBSPOT_PAT = process.env.HUBSPOT_PAT;
 const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION || "3.0.0";
+const POSTHOG_API_KEY = process.env.POSTHOG_API_KEY;
 
 // USERS: JSON map of { "email@antler.co": "assigned-password" }
 let USERS = {};
@@ -108,16 +109,34 @@ function json(data, status = 200, req = null) {
   });
 }
 
-// ── Audit log ────────────────────────────────────────────────────────────────
-function audit(ip, user, slug, result, startMs) {
-  console.log(JSON.stringify({
-    ts: new Date().toISOString(),
-    ip,
-    user: user || "unknown",
-    slug,
-    result,
-    ms: Date.now() - startMs,
-  }));
+// ── Tracking: stdout audit log + PostHog capture ─────────────────────────────
+// Returns a Promise so the caller can pass it to ctx.waitUntil() —
+// PostHog fires after the response is sent, adding zero latency.
+function track(ip, user, slug, result, startMs, clientVersion) {
+  const ms = Date.now() - startMs;
+  const ts = new Date().toISOString();
+
+  console.log(JSON.stringify({ ts, ip, user: user || "unknown", slug, result, ms }));
+
+  if (!POSTHOG_API_KEY) return Promise.resolve();
+
+  return fetch("https://eu.i.posthog.com/capture/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: POSTHOG_API_KEY,
+      event: "lookup_request",
+      distinct_id: user || "unknown",
+      timestamp: ts,
+      properties: {
+        result,
+        slug: slug || null,
+        ms,
+        ip,
+        client_version: clientVersion || null,
+      },
+    }),
+  }).catch(() => {}); // Non-fatal: never block on analytics
 }
 
 // ── LinkedIn slug normalization ───────────────────────────────────────────────
@@ -156,7 +175,7 @@ async function hsFetch(path, options = {}) {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
-export default async function handler(req) {
+export default async function handler(req, ctx) {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: getCorsHeaders(req) });
   }
@@ -167,11 +186,12 @@ export default async function handler(req) {
 
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() || "unknown";
   const startMs = Date.now();
+  const clientVersion = req.headers.get("x-client-version") || "0.0.0";
+  const wt = (p) => ctx?.waitUntil?.(p); // fire-and-forget helper
 
   // Version check
-  const clientVersion = req.headers.get("x-client-version") || "0.0.0";
   if (!meetsMinVersion(clientVersion, MIN_CLIENT_VERSION)) {
-    audit(ip, null, null, "outdated_client", startMs);
+    wt(track(ip, null, null, "outdated_client", startMs, clientVersion));
     return json({ error: "Client out of date — reinstall the script" }, 426, req);
   }
 
@@ -179,13 +199,13 @@ export default async function handler(req) {
   const tsHeader = req.headers.get("x-timestamp");
   const tsMs = tsHeader ? new Date(tsHeader).getTime() : 0;
   if (!tsHeader || isNaN(tsMs) || Math.abs(Date.now() - tsMs) > 5 * 60 * 1000) {
-    audit(ip, null, null, "invalid_timestamp", startMs);
+    wt(track(ip, null, null, "invalid_timestamp", startMs, clientVersion));
     return json({ error: "Request expired" }, 401, req);
   }
 
   // Per-IP rate limit
   if (!checkRateLimit(ipRateLimitMap, ip)) {
-    audit(ip, null, null, "rate_limited_ip", startMs);
+    wt(track(ip, null, null, "rate_limited_ip", startMs, clientVersion));
     return json({ error: "Too many requests" }, 429, req);
   }
 
@@ -193,13 +213,13 @@ export default async function handler(req) {
   const email = (req.headers.get("x-user-email") || "").toLowerCase().trim();
   const password = req.headers.get("x-user-password") || "";
   if (!authenticate(email, password)) {
-    audit(ip, email || null, null, "unauthorized", startMs);
+    wt(track(ip, email || null, null, "unauthorized", startMs, clientVersion));
     return json({ error: "Unauthorized" }, 401, req);
   }
 
   // Per-user rate limit
   if (!checkRateLimit(userRateLimitMap, email)) {
-    audit(ip, email, null, "rate_limited_user", startMs);
+    wt(track(ip, email, null, "rate_limited_user", startMs, clientVersion));
     return json({ error: "Too many requests" }, 429, req);
   }
 
@@ -245,7 +265,7 @@ export default async function handler(req) {
       });
 
     if (contacts.length === 0) {
-      audit(ip, email, slug, "not_found", startMs);
+      wt(track(ip, email, slug, "not_found", startMs, clientVersion));
       return json({ found: false }, 200, req);
     }
 
@@ -299,11 +319,11 @@ export default async function handler(req) {
       }
     }
 
-    audit(ip, email, slug, "found", startMs);
+    wt(track(ip, email, slug, "found", startMs, clientVersion));
     return json({ found: true, hubspotUrl, contactId: primaryContactId, dealLocations }, 200, req);
   } catch (err) {
     console.error("Lookup error:", err.message);
-    audit(ip, email, slug, "error", startMs);
+    wt(track(ip, email, slug, "error", startMs, clientVersion));
     return json({ error: "Lookup failed" }, 502, req);
   }
 }
