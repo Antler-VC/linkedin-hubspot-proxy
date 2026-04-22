@@ -180,38 +180,60 @@ export default async function handler(req) {
             ],
           },
         ],
-        properties: ["linkedin_profile", "hs_object_id"],
+        properties: ["linkedin_profile", "hs_object_id", "hs_lastmodifieddate"],
         limit: 5,
       }),
     });
 
-    const contact = (searchData.results || []).find((c) => {
-      const stored = c.properties.linkedin_profile || "";
-      const storedSlug = normalizeSlug(stored);
-      return storedSlug === slug;
-    });
+    // Collect all contacts matching the slug, sorted by last modified descending
+    const contacts = (searchData.results || [])
+      .filter((c) => normalizeSlug(c.properties.linkedin_profile || "") === slug)
+      .sort((a, b) => {
+        const aDate = new Date(a.properties.hs_lastmodifieddate || 0).getTime();
+        const bDate = new Date(b.properties.hs_lastmodifieddate || 0).getTime();
+        return bDate - aDate;
+      });
 
-    if (!contact) {
+    if (contacts.length === 0) {
       audit(ip, slug, "not_found", startMs);
       return json({ found: false }, 200, req);
     }
 
-    const contactId = contact.properties.hs_object_id;
     const portalId = await getPortalId();
-    const hubspotUrl = `https://${getRegion()}.hubspot.com/contacts/${portalId}/record/0-1/${contactId}`;
+    const region = getRegion();
+
+    // Fetch deal associations for all matching contacts in parallel
+    let allDealIds = [];
+    let contactIdWithDeals = null;
+    try {
+      const assocResults = await Promise.all(
+        contacts.map((c) =>
+          hsFetch(`/crm/v4/objects/contacts/${c.properties.hs_object_id}/associations/deals`)
+            .then((d) => ({ contactId: c.properties.hs_object_id, dealIds: (d.results || []).map((r) => r.toObjectId) }))
+            .catch(() => ({ contactId: c.properties.hs_object_id, dealIds: [] }))
+        )
+      );
+
+      for (const { contactId, dealIds } of assocResults) {
+        if (dealIds.length > 0 && !contactIdWithDeals) contactIdWithDeals = contactId;
+        allDealIds.push(...dealIds);
+      }
+    } catch {
+      // Non-fatal: fall through with no deals
+    }
+
+    // Prefer the most-recently-updated contact that has deals; fall back to most recent overall
+    const primaryContactId = contactIdWithDeals || contacts[0].properties.hs_object_id;
+    const hubspotUrl = `https://${region}.hubspot.com/contacts/${portalId}/record/0-1/${primaryContactId}`;
 
     let dealLocations = [];
-    try {
-      const assocData = await hsFetch(
-        `/crm/v4/objects/contacts/${contactId}/associations/deals`
-      );
-      const dealIds = (assocData.results || []).map((r) => r.toObjectId);
-
-      if (dealIds.length > 0) {
+    const uniqueDealIds = [...new Set(allDealIds)];
+    if (uniqueDealIds.length > 0) {
+      try {
         const dealsData = await hsFetch("/crm/v3/objects/deals/batch/read", {
           method: "POST",
           body: JSON.stringify({
-            inputs: dealIds.map((id) => ({ id: String(id) })),
+            inputs: uniqueDealIds.map((id) => ({ id: String(id) })),
             properties: ["location_choice"],
           }),
         });
@@ -220,16 +242,15 @@ export default async function handler(req) {
           .map((d) => d.properties.location_choice)
           .filter(Boolean);
 
-        const uniqueLocations = [...new Set(rawLocations)];
         const labels = await getLocationLabels();
-        dealLocations = uniqueLocations.map((v) => labels[v] || v);
+        dealLocations = [...new Set(rawLocations)].map((v) => labels[v] || v);
+      } catch {
+        // Non-fatal: return contact without deals
       }
-    } catch {
-      // Non-fatal: return contact without deals
     }
 
     audit(ip, slug, "found", startMs);
-    return json({ found: true, hubspotUrl, contactId, dealLocations }, 200, req);
+    return json({ found: true, hubspotUrl, contactId: primaryContactId, dealLocations }, 200, req);
   } catch (err) {
     console.error("Lookup error:", err.message);
     audit(ip, slug, "error", startMs);
