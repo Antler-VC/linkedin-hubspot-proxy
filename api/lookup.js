@@ -142,6 +142,7 @@ function track(ip, user, slug, result, startMs, clientVersion) {
         ms,
         ip,
         client_version: clientVersion || null,
+        $ip: ip, // tells PostHog to geolocate by real user IP, not Vercel server
       },
     }),
   }).catch(() => {}); // Non-fatal: never block on analytics
